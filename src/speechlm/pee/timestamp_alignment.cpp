@@ -443,12 +443,20 @@ tokenize_stream(
     if (std::any_of(members.begin(), members.end(), [&](int w) {
             return units[w].kind != UnitKind::word;
         })) {
-        for (int w : members)
-            ids_by_word.push_back(
-                units[w].kind != UnitKind::word
-                    ? character_token_ids(
-                          tokenizer, units[w].word, blank, units[w].kind == UnitKind::cluster)
-                    : tokenize_stream(tokenizer, units, {w}, blank).front());
+        for (int w : members) {
+            if (units[w].kind != UnitKind::word) {
+                try {
+                    ids_by_word.push_back(character_token_ids(
+                        tokenizer, units[w].word, blank, units[w].kind == UnitKind::cluster));
+                } catch (const std::runtime_error&) {
+                    // A character outside the CTC vocabulary (e.g. a rare CJK char) drops its own
+                    // alignment instead of failing word timestamps for the whole session.
+                    ids_by_word.emplace_back();
+                }
+            } else {
+                ids_by_word.push_back(tokenize_stream(tokenizer, units, {w}, blank).front());
+            }
+        }
         return ids_by_word;
     }
     std::vector<std::string> words;
@@ -1174,9 +1182,19 @@ align_record(
                 word_frames[stream.state_to_word[path[t]]].push_back(t);
         for (size_t w = 0; w < stream.words.size(); ++w) {
             const auto& f = word_frames[w];
-            if (f.empty())
-                throw std::runtime_error(
-                    "CTC path did not visit word '" + targets.words[stream.words[w]].word + "'.");
+            if (f.empty()) {
+                // A word whose characters fell outside the CTC vocabulary has no states, so the
+                // path cannot visit it; skip its row. Words with states that the path skipped
+                // remain an alignment failure.
+                const bool has_states =
+                    std::find(stream.state_to_word.begin(), stream.state_to_word.end(),
+                              static_cast<int>(w)) != stream.state_to_word.end();
+                if (has_states)
+                    throw std::runtime_error(
+                        "CTC path did not visit word '" +
+                        targets.words[stream.words[w]].word + "'.");
+                continue;
+            }
             WordRow row;
             row.word = stream.words[w];
             row.tag = stream.tag;
